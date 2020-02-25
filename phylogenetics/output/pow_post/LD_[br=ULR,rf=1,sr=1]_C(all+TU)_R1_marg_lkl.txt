@@ -1,0 +1,3 @@
+Method	Marginal_Likelihood
+stepping stone	-115.26
+path sampler	-113.052

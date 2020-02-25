@@ -1,0 +1,26 @@
+############################################################################################
+#
+# Dan Dediu 2019
+#
+# Estimate the the marginal Likelihood (for Bayes Factors-based model selection)
+# as per https://revbayes.github.io/tutorials/model_selection_bayes_factors/bf_intro.html
+#
+############################################################################################
+
+# These variables are defined by the caller: 
+# mymodel, moves, monitors, analysis_name, marg_lkl_cats, marg_lkl_burnin_gen, marg_lkl_burnin_tun, marg_lkl_pow_gen:
+
+# Compute power posterior distributions:
+pow_p = powerPosterior(mymodel, moves, monitors, "../output/pow_post/" + analysis_name + "_powp.out", cats=marg_lkl_cats) 
+pow_p.burnin(generations=marg_lkl_burnin_gen, tuningInterval=marg_lkl_burnin_tun)
+pow_p.run(generations=marg_lkl_pow_gen)  
+
+ss = steppingStoneSampler(file="../output/pow_post/" + analysis_name + "_powp.out", powerColumnName="power", likelihoodColumnName="likelihood")
+print("stepping stone marginal likelihood = ", ss.marginal() )
+
+ps = pathSampler(file="../output/pow_post/" + analysis_name + "_powp.out", powerColumnName="power", likelihoodColumnName="likelihood")
+print("path sampler marginal likelihood = ", ps.marginal() );
+
+write("Method\tMarginal_Likelihood\n", file="../output/pow_post/" + analysis_name + "_marg_lkl.txt")
+write("stepping stone\t" + ss.marginal() + "\n", file="../output/pow_post/" + analysis_name + "_marg_lkl.txt", append=TRUE)
+write("path sampler\t" +   ps.marginal() + "\n", file="../output/pow_post/" + analysis_name + "_marg_lkl.txt", append=TRUE)

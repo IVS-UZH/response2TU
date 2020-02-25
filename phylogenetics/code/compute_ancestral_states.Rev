@@ -1,0 +1,26 @@
+################################################################################
+#
+# Dan Dediu 2019
+#
+# Estimating ancestral character states as per
+# https://revbayes.github.io/tutorials/morph/morph_more.html
+#
+################################################################################
+
+# These variables are defined by the caller: 
+# analysis_name, n_chars, psi:
+
+anc_states = readAncestralStateTrace("../output/anc_states/" + analysis_name + "_anc_states.txt")
+for(i in 1:n_chars)
+{
+  anc_tree = ancestralStateTree(tree=psi, 
+                                ancestral_state_trace_vector=anc_states, 
+                                include_start_states=false, 
+                                file="../output/anc_states/" + analysis_name + "_chr_" + i + ".tree", 
+                                burnin=0.0, 
+                                summary_statistic="MAP", 
+                                site=i)
+  writeNexus(anc_tree, filename="../output/anc_states/" + analysis_name + "_chr_" + i + ".tree")
+}
+
+

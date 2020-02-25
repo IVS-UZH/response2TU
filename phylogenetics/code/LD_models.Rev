@@ -1,0 +1,588 @@
+################################################################################
+#
+# Dan Dediu 2019
+#
+# This is based on LabioDen_DPP_R1.Rev by S. Tarasov 2019
+# but it was heavily modified, as follows:
+#
+#   - more flexible through parametetrs that can be set by the caller
+#   - can sample a set of trees or use a single given tree
+#   - two root frequency models (1 and Dirichlet Prior)
+#   - two site rate models (single rate and mixture models)
+#   - four branch rate models (the original, original + base rate, 
+#     molecular clock, relaxed molecular clock, and unconrrelated rates
+#   - ancestral states estimation
+#   - marginal likelihood estimate (when possible)
+#   - more detailed comments and better structuring
+#
+################################################################################
+
+
+#######################
+# Script parameters
+#######################
+
+# Some of these parameters might be defined by the caller (otherwise use default values):
+if( !exists("script_name") )           {script_name           = "LD"} # script name
+if( !exists("run_number") )            {run_number            = "1"}   # run number
+if( !exists("data_file") )             {data_file             ="../data/matrix_LB.nex"} # which data file?
+if( !exists("trees_sample_file") )     {trees_sample_file     ="../data/indoeuropean-B.tre"} # which trees sample file?
+if( !exists("mcc_tree_file") )         {mcc_tree_file         ="../data/indoeuropean-B-sum-matched.tre"} # the MCC consensus tree (only if which_tree == 0)
+if( !exists("trees_sample_name") )     {trees_sample_name     ="B"} # which name to use for this trees sample?
+if( !exists("which_tree") )            {which_tree            ="all"} # use a particular tree or the whole sample? (0 means the MCC tree)
+if( !exists("tree_sampling_method") )  {tree_sampling_method  =v("TU", "RIW")[1]} # if sampling the trees, which method to use?
+
+if( !exists("is_full_run") )           {is_full_run           = FALSE} # is this a full run or a debug run (the default is a debug)?
+if( !exists("burnin_generations") )    {burnin_generations    = ifelse(is_full_run,  10000, 1000)} # burn-in
+if( !exists("burnin_tuningInterval") ) {burnin_tuningInterval = ifelse(is_full_run,   5000,  200)} # tuning interval
+if( !exists("mcmc_generations") )      {mcmc_generations      = ifelse(is_full_run, 500000, 2000)} # mcmc iterations
+if( !exists("printgen_model") )        {printgen_model        = 10}  # thinning for the full model monitor
+if( !exists("printgen_screen") )       {printgen_screen       = 500} # screen progress thinning
+if( !exists("printgen_ancstates") )    {printgen_ancstates    = 10} # thinning for the ancestral states monitor
+
+if( !exists("run_ancstates_mon") )     {run_ancstates_mon      = TRUE} # should save the encestral states to file?
+if( !exists("run_ancstates_estim") )   {run_ancstates_estim    = FALSE} # should map encestral states to the tree?
+if( !exists("run_marg_likelihood") )   {run_marg_likelihood    = FALSE} # should attempt to estimate the marginal likelihood (for model comparison)?
+if( !exists("marg_lkl_cats") )         {marg_lkl_cats          = ifelse(is_full_run,     50,    5)} # for marginal likelihood, number of steps
+if( !exists("marg_lkl_burnin_gen") )   {marg_lkl_burnin_gen    = ifelse(is_full_run, 100000, 1000)} # for marginal likelihood, burn-in generations
+if( !exists("marg_lkl_burnin_tun") )   {marg_lkl_burnin_tun    = ifelse(is_full_run,   1000,  200)} # for marginal likelihood, burn-in tuning
+if( !exists("marg_lkl_pow_gen") )      {marg_lkl_pow_gen       = ifelse(is_full_run,  10000, 1000)} # for marginal likelihood, number of generations
+if( !exists("run_mcmc") )              {run_mcmc               = !run_marg_likelihood} # should run the mcmc?
+
+if( !exists("branch_rates_model") )    {branch_rates_model     = v("MC", "ULR", "TU", "TUBR", "RMC")[1]} # the branch rates model
+if( !exists("root_freq_model") )       {root_freq_model        = v("1", "DP")[1]} # the root frequencies model
+if( !exists("site_rates_model") )      {site_rates_model       = v("1", "MM")[1]} # the site rates model
+
+# The full analysis name:
+analysis_name = script_name + "_[br=" + branch_rates_model + ",rf=" + root_freq_model + ",sr=" + site_rates_model + "]_" + trees_sample_name + ifelse(which_tree == "all", "(all+" + tree_sampling_method + ")", "(" + ifelse(which_tree == 0, "MCC", which_tree) + ")") + "_R" + run_number
+
+# Display model:
+print("Running model:");
+print("  - branch rates model: "+ branch_rates_model + " " +
+        ifelse( branch_rates_model == "MC", "(the molecular clock model)",
+                ifelse(branch_rates_model == "RMC", "(the relaxed molecualr clock model)",
+                       ifelse(branch_rates_model == "ULR", "(the uncorrelated lognormal rates model)",
+                              ifelse(branch_rates_model == "TU", "(the TU model == custom Dirichlet process prior])",
+                                     ifelse(branch_rates_model == "TUBR", "(the TU model + base rate == Dirichlet process prior)",
+                                            "unknown model"))))));
+print("  - root frequency model: "+ root_freq_model + " " +
+        ifelse( root_freq_model == "1", "([1,1])",
+                ifelse(root_freq_model == "DP", "(Dirichlet prior)",
+                       "unknown model")));
+print("  - site rates model: "+ site_rates_model + " " +
+        ifelse( site_rates_model == "1", "(single rate)",
+                ifelse(site_rates_model == "MM", "(mixture model)",
+                       "unknown model")));
+print(ifelse(which_tree == "all", "  - move across the trees sample (using " + ifelse(tree_sampling_method == "TU", "TU's method", "a Random Integer Walk") + ")", 
+             ifelse(which_tree == 0, "  - the MCC consensus tree", "  - given tree: "+ which_tree)));
+print("\n")
+print("File name: " + analysis_name + "\n")
+
+
+# Important models:
+#
+# +--------------------+-----------------+------------------+------+------------------------------------------+-------------------------------------+
+# | branch_rates_model | root_freq_model | site_rates_model | name | description                              | comments                            | 
+# +--------------------+-----------------+------------------+------+------------------------------------------+-------------------------------------+
+# | MC                 | 1               | 1                | M00  | simplest model                           |                                     |
+# | MC                 | DP              | MM               | M11  | full model - single branch rate          |                                     |
+# | ULR                | 1               | 1                | U00  | uncorrelated branch rate                 |                                     |
+# | ULR                | DP              | MM               | U11  | full model - uncorrelated branch rate    |                                     |
+# | RMC                | 1               | 1                | R00  | allow branch rate variation              |                                     |
+# | RMC                | DP              | 1                | R10  | allow branch rate variation + root prior |                                     |
+# | RMC                | 1               | MM               | R01  | allow branch and site rate variation     |                                     |
+# | RMC                | DP              | MM               | R11  | full model - branch rates                |                                     |
+# | TU                 | 1               | 1                | T00  | original TU model                        | cannot estimate marginal likelihood |
+# | TUBR               | 1               | 1                | B00  | original TU model + base branch rate     | --"--                               |
+# | TU                 | DP              | 1                | T10  | original TU model + root prior           | --"--                               |
+# | TU                 | 1               | MM               | T01  | original TU model + site rate variation  | --"--                               |
+# +--------------------+-----------------+------------------+------+------------------------------------------+-------------------------------------+
+#
+# Full rb commands for these models using the "B" trees:
+# M00: 
+#   clear(); branch_rates_model="MC"; root_freq_model="1"; site_rates_model="1"; run_marg_likelihood=FALSE; which_tree="all"; run_number=1; is_full_run=TRUE; source("./LD_models.Rev");
+#   clear(); branch_rates_model="MC"; root_freq_model="1"; site_rates_model="1"; run_marg_likelihood=FALSE; which_tree="all"; run_number=2; is_full_run=TRUE; source("./LD_models.Rev");
+#   clear(); branch_rates_model="MC"; root_freq_model="1"; site_rates_model="1"; run_marg_likelihood=TRUE; which_tree="all"; run_number=1; is_full_run=TRUE; source("./LD_models.Rev");
+#
+# M11: 
+#   clear(); branch_rates_model="MC"; root_freq_model="DP"; site_rates_model="MM"; run_marg_likelihood=FALSE; which_tree="all"; run_number=1; is_full_run=TRUE; source("./LD_models.Rev");
+#   clear(); branch_rates_model="MC"; root_freq_model="DP"; site_rates_model="MM"; run_marg_likelihood=FALSE; which_tree="all"; run_number=2; is_full_run=TRUE; source("./LD_models.Rev");
+#   clear(); branch_rates_model="MC"; root_freq_model="DP"; site_rates_model="MM"; run_marg_likelihood=TRUE; which_tree="all"; run_number=1; is_full_run=TRUE; source("./LD_models.Rev");
+#
+# U00: 
+#   clear(); branch_rates_model="ULR"; root_freq_model="1"; site_rates_model="1"; run_marg_likelihood=FALSE; which_tree="all"; run_number=1; is_full_run=TRUE; source("./LD_models.Rev");
+#   clear(); branch_rates_model="ULR"; root_freq_model="1"; site_rates_model="1"; run_marg_likelihood=FALSE; which_tree="all"; run_number=2; is_full_run=TRUE; source("./LD_models.Rev");
+#   clear(); branch_rates_model="ULR"; root_freq_model="1"; site_rates_model="1"; run_marg_likelihood=TRUE; which_tree="all"; run_number=1; is_full_run=TRUE; source("./LD_models.Rev");
+#
+# U11: 
+#   clear(); branch_rates_model="ULR"; root_freq_model="DP"; site_rates_model="MM"; run_marg_likelihood=FALSE; which_tree="all"; run_number=1; is_full_run=TRUE; source("./LD_models.Rev");
+#   clear(); branch_rates_model="ULR"; root_freq_model="DP"; site_rates_model="MM"; run_marg_likelihood=FALSE; which_tree="all"; run_number=2; is_full_run=TRUE; source("./LD_models.Rev");
+#   clear(); branch_rates_model="ULR"; root_freq_model="DP"; site_rates_model="MM"; run_marg_likelihood=TRUE; which_tree="all"; run_number=1; is_full_run=TRUE; source("./LD_models.Rev");
+#
+# R00: 
+#   clear(); branch_rates_model="RMC"; root_freq_model="1"; site_rates_model="1"; run_marg_likelihood=FALSE; which_tree="all"; run_number=1; is_full_run=TRUE; source("./LD_models.Rev");
+#   clear(); branch_rates_model="RMC"; root_freq_model="1"; site_rates_model="1"; run_marg_likelihood=FALSE; which_tree="all"; run_number=2; is_full_run=TRUE; source("./LD_models.Rev");
+#   clear(); branch_rates_model="RMC"; root_freq_model="1"; site_rates_model="1"; run_marg_likelihood=TRUE; which_tree="all"; run_number=1; is_full_run=TRUE; source("./LD_models.Rev");
+#
+# R10: 
+#   clear(); branch_rates_model="RMC"; root_freq_model="DP"; site_rates_model="1"; run_marg_likelihood=FALSE; which_tree="all"; run_number=1; is_full_run=TRUE; source("./LD_models.Rev");
+#   clear(); branch_rates_model="RMC"; root_freq_model="DP"; site_rates_model="1"; run_marg_likelihood=FALSE; which_tree="all"; run_number=2; is_full_run=TRUE; source("./LD_models.Rev");
+#   clear(); branch_rates_model="RMC"; root_freq_model="DP"; site_rates_model="1"; run_marg_likelihood=TRUE; which_tree="all"; run_number=1; is_full_run=TRUE; source("./LD_models.Rev");
+#
+# R01: 
+#   clear(); branch_rates_model="RMC"; root_freq_model="1"; site_rates_model="MM"; run_marg_likelihood=FALSE; which_tree="all"; run_number=1; is_full_run=TRUE; source("./LD_models.Rev");
+#   clear(); branch_rates_model="RMC"; root_freq_model="1"; site_rates_model="MM"; run_marg_likelihood=FALSE; which_tree="all"; run_number=2; is_full_run=TRUE; source("./LD_models.Rev");
+#   clear(); branch_rates_model="RMC"; root_freq_model="1"; site_rates_model="MM"; run_marg_likelihood=TRUE; which_tree="all"; run_number=1; is_full_run=TRUE; source("./LD_models.Rev");
+#
+# R11: 
+#   clear(); branch_rates_model="RMC"; root_freq_model="DP"; site_rates_model="MM"; run_marg_likelihood=FALSE; which_tree="all"; run_number=1; is_full_run=TRUE; source("./LD_models.Rev");
+#   clear(); branch_rates_model="RMC"; root_freq_model="DP"; site_rates_model="MM"; run_marg_likelihood=FALSE; which_tree="all"; run_number=2; is_full_run=TRUE; source("./LD_models.Rev");
+#   clear(); branch_rates_model="RMC"; root_freq_model="DP"; site_rates_model="MM"; run_marg_likelihood=TRUE; which_tree="all"; run_number=1; is_full_run=TRUE; source("./LD_models.Rev");
+#
+# T00: 
+#   clear(); branch_rates_model="TU"; root_freq_model="1"; site_rates_model="1"; run_marg_likelihood=FALSE; which_tree="all"; run_number=1; is_full_run=TRUE; source("./LD_models.Rev");
+#   clear(); branch_rates_model="TU"; root_freq_model="1"; site_rates_model="1"; run_marg_likelihood=FALSE; which_tree="all"; run_number=2; is_full_run=TRUE; source("./LD_models.Rev");
+#   clear(); branch_rates_model="TU"; root_freq_model="1"; site_rates_model="1"; run_marg_likelihood=TRUE; which_tree="all"; run_number=1; is_full_run=TRUE; source("./LD_models.Rev"); --> Error: Cannot apply Gibbs sampler when the probability is heated.
+#
+# B00: 
+#   clear(); branch_rates_model="TUBR"; root_freq_model="1"; site_rates_model="1"; run_marg_likelihood=FALSE; which_tree="all"; run_number=1; is_full_run=TRUE; source("./LD_models.Rev");
+#   clear(); branch_rates_model="TUBR"; root_freq_model="1"; site_rates_model="1"; run_marg_likelihood=FALSE; which_tree="all"; run_number=2; is_full_run=TRUE; source("./LD_models.Rev");
+#   clear(); branch_rates_model="TUBR"; root_freq_model="1"; site_rates_model="1"; run_marg_likelihood=TRUE; which_tree="all"; run_number=1; is_full_run=TRUE; source("./LD_models.Rev"); --> Error: Cannot apply Gibbs sampler when the probability is heated.
+#
+# T10: 
+#   clear(); branch_rates_model="TU"; root_freq_model="DP"; site_rates_model="1"; run_marg_likelihood=FALSE; which_tree="all"; run_number=1; is_full_run=TRUE; source("./LD_models.Rev");
+#   clear(); branch_rates_model="TU"; root_freq_model="DP"; site_rates_model="1"; run_marg_likelihood=FALSE; which_tree="all"; run_number=2; is_full_run=TRUE; source("./LD_models.Rev");
+#   clear(); branch_rates_model="TU"; root_freq_model="DP"; site_rates_model="1"; run_marg_likelihood=TRUE; which_tree="all"; run_number=1; is_full_run=TRUE; source("./LD_models.Rev"); --> Error: Cannot apply Gibbs sampler when the probability is heated.
+#
+# T01: 
+#   clear(); branch_rates_model="TU"; root_freq_model="1"; site_rates_model="MM"; run_marg_likelihood=FALSE; which_tree="all"; run_number=1; is_full_run=TRUE; source("./LD_models.Rev");
+#   clear(); branch_rates_model="TU"; root_freq_model="1"; site_rates_model="MM"; run_marg_likelihood=FALSE; which_tree="all"; run_number=2; is_full_run=TRUE; source("./LD_models.Rev");
+#   clear(); branch_rates_model="TU"; root_freq_model="1"; site_rates_model="MM"; run_marg_likelihood=TRUE; which_tree="all"; run_number=1; is_full_run=TRUE; source("./LD_models.Rev");
+#
+#
+#
+# Full rb commands for these models using the "C" trees:
+# M00: 
+#   clear(); branch_rates_model="MC"; root_freq_model="1"; site_rates_model="1"; run_marg_likelihood=FALSE; which_tree="all"; run_number=1; is_full_run=TRUE; trees_sample_file="../data/indoeuropean-C.tre"; trees_sample_name="C"; source("./LD_models.Rev");
+#   clear(); branch_rates_model="MC"; root_freq_model="1"; site_rates_model="1"; run_marg_likelihood=FALSE; which_tree="all"; run_number=2; is_full_run=TRUE; trees_sample_file="../data/indoeuropean-C.tre"; trees_sample_name="C"; source("./LD_models.Rev");
+#   clear(); branch_rates_model="MC"; root_freq_model="1"; site_rates_model="1"; run_marg_likelihood=TRUE; which_tree="all"; run_number=1; is_full_run=TRUE; trees_sample_file="../data/indoeuropean-C.tre"; trees_sample_name="C"; source("./LD_models.Rev");
+#
+# M11: 
+#   clear(); branch_rates_model="MC"; root_freq_model="DP"; site_rates_model="MM"; run_marg_likelihood=FALSE; which_tree="all"; run_number=1; is_full_run=TRUE; trees_sample_file="../data/indoeuropean-C.tre"; trees_sample_name="C"; source("./LD_models.Rev");
+#   clear(); branch_rates_model="MC"; root_freq_model="DP"; site_rates_model="MM"; run_marg_likelihood=FALSE; which_tree="all"; run_number=2; is_full_run=TRUE; trees_sample_file="../data/indoeuropean-C.tre"; trees_sample_name="C"; source("./LD_models.Rev");
+#   clear(); branch_rates_model="MC"; root_freq_model="DP"; site_rates_model="MM"; run_marg_likelihood=TRUE; which_tree="all"; run_number=1; is_full_run=TRUE; trees_sample_file="../data/indoeuropean-C.tre"; trees_sample_name="C"; source("./LD_models.Rev");
+#
+# U00: 
+#   clear(); branch_rates_model="ULR"; root_freq_model="1"; site_rates_model="1"; run_marg_likelihood=FALSE; which_tree="all"; run_number=1; is_full_run=TRUE; trees_sample_file="../data/indoeuropean-C.tre"; trees_sample_name="C"; source("./LD_models.Rev");
+#   clear(); branch_rates_model="ULR"; root_freq_model="1"; site_rates_model="1"; run_marg_likelihood=FALSE; which_tree="all"; run_number=2; is_full_run=TRUE; trees_sample_file="../data/indoeuropean-C.tre"; trees_sample_name="C"; source("./LD_models.Rev");
+#   clear(); branch_rates_model="ULR"; root_freq_model="1"; site_rates_model="1"; run_marg_likelihood=TRUE; which_tree="all"; run_number=1; is_full_run=TRUE; trees_sample_file="../data/indoeuropean-C.tre"; trees_sample_name="C"; source("./LD_models.Rev");
+#
+# U11: 
+#   clear(); branch_rates_model="ULR"; root_freq_model="DP"; site_rates_model="MM"; run_marg_likelihood=FALSE; which_tree="all"; run_number=1; is_full_run=TRUE; trees_sample_file="../data/indoeuropean-C.tre"; trees_sample_name="C"; source("./LD_models.Rev");
+#   clear(); branch_rates_model="ULR"; root_freq_model="DP"; site_rates_model="MM"; run_marg_likelihood=FALSE; which_tree="all"; run_number=2; is_full_run=TRUE; trees_sample_file="../data/indoeuropean-C.tre"; trees_sample_name="C"; source("./LD_models.Rev");
+#   clear(); branch_rates_model="ULR"; root_freq_model="DP"; site_rates_model="MM"; run_marg_likelihood=TRUE; which_tree="all"; run_number=1; is_full_run=TRUE; trees_sample_file="../data/indoeuropean-C.tre"; trees_sample_name="C"; source("./LD_models.Rev");
+#
+# R00: 
+#   clear(); branch_rates_model="RMC"; root_freq_model="1"; site_rates_model="1"; run_marg_likelihood=FALSE; which_tree="all"; run_number=1; is_full_run=TRUE; trees_sample_file="../data/indoeuropean-C.tre"; trees_sample_name="C"; source("./LD_models.Rev");
+#   clear(); branch_rates_model="RMC"; root_freq_model="1"; site_rates_model="1"; run_marg_likelihood=FALSE; which_tree="all"; run_number=2; is_full_run=TRUE; trees_sample_file="../data/indoeuropean-C.tre"; trees_sample_name="C"; source("./LD_models.Rev");
+#   clear(); branch_rates_model="RMC"; root_freq_model="1"; site_rates_model="1"; run_marg_likelihood=TRUE; which_tree="all"; run_number=1; is_full_run=TRUE; trees_sample_file="../data/indoeuropean-C.tre"; trees_sample_name="C"; source("./LD_models.Rev");
+#
+# R10: 
+#   clear(); branch_rates_model="RMC"; root_freq_model="DP"; site_rates_model="1"; run_marg_likelihood=FALSE; which_tree="all"; run_number=1; is_full_run=TRUE; trees_sample_file="../data/indoeuropean-C.tre"; trees_sample_name="C"; source("./LD_models.Rev");
+#   clear(); branch_rates_model="RMC"; root_freq_model="DP"; site_rates_model="1"; run_marg_likelihood=FALSE; which_tree="all"; run_number=2; is_full_run=TRUE; trees_sample_file="../data/indoeuropean-C.tre"; trees_sample_name="C"; source("./LD_models.Rev");
+#   clear(); branch_rates_model="RMC"; root_freq_model="DP"; site_rates_model="1"; run_marg_likelihood=TRUE; which_tree="all"; run_number=1; is_full_run=TRUE; trees_sample_file="../data/indoeuropean-C.tre"; trees_sample_name="C"; source("./LD_models.Rev");
+#
+# R01: 
+#   clear(); branch_rates_model="RMC"; root_freq_model="1"; site_rates_model="MM"; run_marg_likelihood=FALSE; which_tree="all"; run_number=1; is_full_run=TRUE; trees_sample_file="../data/indoeuropean-C.tre"; trees_sample_name="C"; source("./LD_models.Rev");
+#   clear(); branch_rates_model="RMC"; root_freq_model="1"; site_rates_model="MM"; run_marg_likelihood=FALSE; which_tree="all"; run_number=2; is_full_run=TRUE; trees_sample_file="../data/indoeuropean-C.tre"; trees_sample_name="C"; source("./LD_models.Rev");
+#   clear(); branch_rates_model="RMC"; root_freq_model="1"; site_rates_model="MM"; run_marg_likelihood=TRUE; which_tree="all"; run_number=1; is_full_run=TRUE; trees_sample_file="../data/indoeuropean-C.tre"; trees_sample_name="C"; source("./LD_models.Rev");
+#
+# R11: 
+#   clear(); branch_rates_model="RMC"; root_freq_model="DP"; site_rates_model="MM"; run_marg_likelihood=FALSE; which_tree="all"; run_number=1; is_full_run=TRUE; trees_sample_file="../data/indoeuropean-C.tre"; trees_sample_name="C"; source("./LD_models.Rev");
+#   clear(); branch_rates_model="RMC"; root_freq_model="DP"; site_rates_model="MM"; run_marg_likelihood=FALSE; which_tree="all"; run_number=2; is_full_run=TRUE; trees_sample_file="../data/indoeuropean-C.tre"; trees_sample_name="C"; source("./LD_models.Rev");
+#   clear(); branch_rates_model="RMC"; root_freq_model="DP"; site_rates_model="MM"; run_marg_likelihood=TRUE; which_tree="all"; run_number=1; is_full_run=TRUE; trees_sample_file="../data/indoeuropean-C.tre"; trees_sample_name="C"; source("./LD_models.Rev");
+#
+# T00: 
+#   clear(); branch_rates_model="TU"; root_freq_model="1"; site_rates_model="1"; run_marg_likelihood=FALSE; which_tree="all"; run_number=1; is_full_run=TRUE; trees_sample_file="../data/indoeuropean-C.tre"; trees_sample_name="C"; source("./LD_models.Rev");
+#   clear(); branch_rates_model="TU"; root_freq_model="1"; site_rates_model="1"; run_marg_likelihood=FALSE; which_tree="all"; run_number=2; is_full_run=TRUE; trees_sample_file="../data/indoeuropean-C.tre"; trees_sample_name="C"; source("./LD_models.Rev");
+#
+# B00: 
+#   clear(); branch_rates_model="TUBR"; root_freq_model="1"; site_rates_model="1"; run_marg_likelihood=FALSE; which_tree="all"; run_number=1; is_full_run=TRUE; trees_sample_file="../data/indoeuropean-C.tre"; trees_sample_name="C"; source("./LD_models.Rev");
+#   clear(); branch_rates_model="TUBR"; root_freq_model="1"; site_rates_model="1"; run_marg_likelihood=FALSE; which_tree="all"; run_number=2; is_full_run=TRUE; trees_sample_file="../data/indoeuropean-C.tre"; trees_sample_name="C"; source("./LD_models.Rev");
+#
+# T10: 
+#   clear(); branch_rates_model="TU"; root_freq_model="DP"; site_rates_model="1"; run_marg_likelihood=FALSE; which_tree="all"; run_number=1; is_full_run=TRUE; trees_sample_file="../data/indoeuropean-C.tre"; trees_sample_name="C"; source("./LD_models.Rev");
+#   clear(); branch_rates_model="TU"; root_freq_model="DP"; site_rates_model="1"; run_marg_likelihood=FALSE; which_tree="all"; run_number=2; is_full_run=TRUE; trees_sample_file="../data/indoeuropean-C.tre"; trees_sample_name="C"; source("./LD_models.Rev");
+#
+# T01: 
+#   clear(); branch_rates_model="TU"; root_freq_model="1"; site_rates_model="MM"; run_marg_likelihood=FALSE; which_tree="all"; run_number=1; is_full_run=TRUE; trees_sample_file="../data/indoeuropean-C.tre"; trees_sample_name="C"; source("./LD_models.Rev");
+#   clear(); branch_rates_model="TU"; root_freq_model="1"; site_rates_model="MM"; run_marg_likelihood=FALSE; which_tree="all"; run_number=2; is_full_run=TRUE; trees_sample_file="../data/indoeuropean-C.tre"; trees_sample_name="C"; source("./LD_models.Rev");
+#
+#
+# Command fragments for running the MCC consensus trees:
+# B trees:  [...] which_tree=0; trees_sample_name="B"; mcc_tree_file="../data/indoeuropean-B-sum-matched.tre"; source("./LD_models.Rev");
+# C trees:  [...] which_tree=0; trees_sample_name="C"; mcc_tree_file="../data/indoeuropean-C-sum-matched.tre"; source("./LD_models.Rev");
+
+
+#######################
+# Data and trees
+#######################
+
+# The data and its characteristics:
+data = readDiscreteCharacterData(file=data_file) # the data file
+languages <- data.names()         # the language names
+n_chars <- data.nchar()           # the number of characters
+n_languages <- data.ntaxa()       # the number of languages
+n_branches <- 2 * n_languages - 2 # and the number of branches in the trees
+
+# The phylogenies:
+if( which_tree != 0 ) {
+  # Read them only if the tree is not the MCC tree (which is stored in a separate file):
+  observed_phylogeny <- readTrees(trees_sample_file) # the trees
+  phylo_size <- observed_phylogeny.size() # the number of trees
+}
+
+
+
+#######################
+# Set-up
+#######################
+
+# The moves and monitors:
+moves    = VectorMoves()
+monitors = VectorMonitors()
+
+
+
+#######################
+# Trees sample
+#######################
+
+if( which_tree == "all" ) {
+  # The current tree is not given: let it move across the trees sample:
+  if( tree_sampling_method == "TU" ) {
+    # The original TU method:
+    tr_rnd ~ dnUniform(1, phylo_size)
+    moves.append( mvSlide(tr_rnd, tune=false, weight=1, phylo_size) )
+    tr_id := round(tr_rnd)
+    psi := observed_phylogeny[tr_id]
+  }
+  
+  if( tree_sampling_method == "RIW" ) {
+    # Using a random integer walk:
+    tr_id ~ dnUniformNatural(1, phylo_size)
+    moves.append( mvRandomIntegerWalk(tr_id, weight=1) )
+    psi := observed_phylogeny[tr_id]
+  }
+} else {
+  if( which_tree == 0 ) {
+    # The current tree is fixed to the MCC consensus tree:
+    psi <- readTrees(mcc_tree_file)[1]
+    phylo_size <- 1
+  } else {
+    # The current tree is given:
+    if( which_tree < 1 || which_tree > phylo_size ) {tr_id = 1} else {tr_id = round(which_tree)}
+    psi <- observed_phylogeny[tr_id]
+  }
+}
+
+
+
+#######################
+# The rate(s) model
+#######################
+
+# https://revbayes.github.io/tutorials/clocks/#specifying-branch-rate-models
+
+if( branch_rates_model == "MC" ) {
+  # The molecular clock (a single rate across branches; https://revbayes.github.io/tutorials/clocks/#specifying-branch-rate-models):
+  branch_rates ~ dnGamma(2.0,4.0)
+  moves.append( mvScale(branch_rates, lambda=0.5, tune=true, weight=1) )
+  
+  n_cats <- 1
+  mean_rt := branch_rates
+}
+
+if( branch_rates_model == "ULR" ) {
+  # The uncorrelated lognormal rates model (https://revbayes.github.io/tutorials/clocks/#specifying-branch-rate-models):
+  ucln_mean ~ dnExponential(2.0)
+  ucln_sigma ~ dnExponential(3.0)
+  ucln_var := ucln_sigma * ucln_sigma
+  ucln_mu := ln(ucln_mean) - (ucln_var * 0.5)
+  moves.append( mvScale(ucln_mean, lambda=1.0, tune=true, weight=1) )
+  moves.append( mvScale(ucln_sigma, lambda=0.5, tune=true, weight=1) )
+  
+  for(i in 1:n_branches) {
+    branch_rates[i] ~ dnLnorm(ucln_mu, ucln_sigma)
+    moves.append( mvScale(branch_rates[i], lambda=1, tune=true, weight=1) )
+  }
+  moves.append( mvVectorScale(branch_rates,lambda=1.0,tune=true,weight=1) )
+  moves.append( mvVectorSingleElementScale(branch_rates,lambda=30.0,tune=true,weight=1) )
+  
+  n_cats := fnNumUniqueInVector(branch_rates)
+  mean_rt := mean(branch_rates)
+} 
+
+if( branch_rates_model == "TU" ) {
+  # The "original" TU model (Dirichlet process prior model)
+  # This is apprently inspired from https://github.com/revbayes/revbayes_tutorial/blob/master/RB_DPPRelaxedClock_Tutorial/scripts/m_DPP_bears.Revs
+  # Unfortunately, the DPP has issues with the estimation of marginal likelihood, so can't be used for proper model comparison :(
+  # The concentration parameter of the DPP set to an expected value that leads to ~ 3 rate categories:
+  pr_mean_cats <- 3.0
+  mean_CP      <- fnDppConcFromMean(pr_mean_cats, n_branches)
+  cp_shape     <- 2.0
+  cp_rate      <- cp_shape / mean_CP
+  concentration ~ dnGamma(cp_shape, cp_rate)
+  
+  # The base-distribution (G0) from which the rate for each category is drawn (here, a gamma distribution):
+  g0_a <- 4.0
+  g0_b <- 8.0
+  g0 = dnGamma(g0_a, g0_b)
+  
+  # The vector of branch rates are given a Dirichlet process prior conditioned on the concentration parameter, the base distribution, and the number of branches:
+  branch_rates ~ dnDPP( baseDistribution=g0, concentration=concentration, numElements=n_branches)
+  
+  # Number of unique branch rate values (also needed for the Gibbs move on the gamma-distributed concentration parameter):
+  n_cats := fnNumUniqueInVector(branch_rates)
+  
+  # Mean branch rate:
+  mean_rt := mean(branch_rates)
+  
+  # The Gibbs moves for the DPP-distributed variable (these moves are always accepted and are never re-tuned):
+  moves.append( mvDPPValueScaling( branch_rates, weight=1, ln(2.0) ) )
+  moves.append( mvDPPAllocateAuxGibbs( branch_rates, numAux=4, weight=1 ) )
+  moves.append( mvDPPGibbsConcentration(concentration=concentration, numDPPCats=n_cats, gammaShape=cp_shape, gammaRate=cp_rate, numElements=n_branches, weight=1) )
+}
+
+if( branch_rates_model == "TUBR" ) {
+  # The TU model + base rate (Dirichlet process prior model as in the tutorial)
+  # This is apprently inspired from https://github.com/revbayes/revbayes_tutorial/blob/master/RB_DPPRelaxedClock_Tutorial/scripts/m_DPP_bears.Revs
+  # Unfortunately, the DPP has issues with the estimation of marginal likelihood, so can't be used for proper model comparison :(
+  # The concentration parameter of the DPP set to an expected value that leads to ~ 3 rate categories:
+  pr_mean_cats <- 3.0
+  mean_CP      <- fnDppConcFromMean(pr_mean_cats, n_branches)
+  cp_shape     <- 2.0
+  cp_rate      <- cp_shape / mean_CP
+  concentration ~ dnGamma(cp_shape, cp_rate)
+  
+  # The base-distribution (G0) from which the rate for each category is drawn (here, a gamma distribution):
+  g0_a <- 4.0
+  g0_b <- 8.0
+  g0 = dnGamma(g0_a, g0_b)
+  
+  # The vector of branch rates are given a Dirichlet process prior conditioned on the concentration parameter, the base distribution, and the number of branches:
+  # NB: I replaced "branch_rates" by "branch_rates_raw" and "branch_subrates" by "branch_rates" to maintain naming consistency with the other models
+  branch_rates_raw ~ dnDPP( baseDistribution=g0, concentration=concentration, numElements=n_branches)
+  
+  # Number of unique branch rate values (also needed for the Gibbs move on the gamma-distributed concentration parameter):
+  n_cats := fnNumUniqueInVector(branch_rates_raw)
+  
+  # The Gibbs moves for the DPP-distributed variable (these moves are always accepted and are never re-tuned):
+  moves.append( mvDPPValueScaling( branch_rates_raw, weight=1, ln(2.0) ) )
+  moves.append( mvDPPAllocateAuxGibbs( branch_rates_raw, numAux=4, weight=1 ) )
+  moves.append( mvDPPGibbsConcentration(concentration=concentration, numDPPCats=n_cats, gammaShape=cp_shape, gammaRate=cp_rate, numElements=n_branches, weight=1) )
+  
+  # Base rates
+  # Add a base rate of change with a lognormal prior and a scale move:
+  # (the origianal TU implementation did not include it but present in https://github.com/revbayes/revbayes_tutorial/blob/master/RB_DPPRelaxedClock_Tutorial/scripts/m_DPP_bears.Revs )
+  br_M  <- 5.4E-3
+  br_s  <- 0.05
+  br_mu <- ln(br_M) - ((br_s * br_s) * 0.5)
+  base_rate ~ dnLnorm(br_mu, br_s)
+  moves.append( mvScale(base_rate, lambda=0.25, tune=true, weight=1) )
+  
+  # The branch rates used in the phylogenetic CTMC are a function of the DPP branch rates and the base rate:
+  branch_rates := branch_rates_raw * base_rate
+  
+  # Mean branch rate:
+  mean_rt := mean(branch_rates)
+}
+
+if( branch_rates_model == "RMC" ) {
+  # The Relaxed morphological clock (https://revbayes.github.io/tutorials/cont_traits/relaxed_bm.html):
+  sigma2_root ~ dnLoguniform(1e-3, 1)
+  moves.append( mvScale(sigma2_root, weight=1) )
+  
+  expected_number_of_shifts <- 4
+  rate_shift_probability    <- expected_number_of_shifts / n_branches
+  
+  sd = 0.578
+  rate_shift_distribution = dnLognormal(-sd^2/2, sd)
+  
+  for(i in n_branches:1) {
+    # draw the rate multiplier from a mixture distribution
+    branch_rate_multiplier[i] ~ dnReversibleJumpMixture(1, rate_shift_distribution, Probability(1 - rate_shift_probability) )
+    
+    # compute the rate for the branch
+    if ( psi.isRoot( psi.parent(i) ) ) {
+      branch_rates[i] := sigma2_root * branch_rate_multiplier[i]
+    } else {
+      branch_rates[i] := branch_rates[psi.parent(i)] * branch_rate_multiplier[i]
+    }
+    
+    # keep track of whether the branch has a rate shift
+    branch_rate_shift[i] := ifelse( branch_rate_multiplier[i] == 1, 0, 1 )
+    
+    # use reversible-jump to move between models with and without
+    # shifts on the branch
+    moves.append( mvRJSwitch(branch_rate_multiplier[i], weight=1) )
+    
+    # include proposals on the rate mutliplier (when it is not 1)
+    moves.append( mvScale(branch_rate_multiplier[i], weight=1) )
+  }
+  
+  n_cats := sum( branch_rate_shift )
+  mean_rt := mean(branch_rates)
+}
+
+
+
+#######################
+# Character Evolution Model
+#######################
+
+if( site_rates_model == "1" ) {
+  # Single rate across characters:
+  # Rate prior and move:
+  r12 ~ dnExp(10)
+  moves.append( mvScale(r12, lambda=1, tune=true, weight=1) )
+  
+  # The rate matrix:
+  Q := fnFreeK(transition_rates = [ [0,   1], 
+                                    [r12, 0] ], 
+               rescaled=false, matrixExponentialMethod="eigen")
+}
+
+if( site_rates_model == "MM" ) {
+  # Mixture model (inspired from https://revbayes.github.io/tutorials/morph/ ):
+  n_cats_rates = 2 # how many of categories?
+  
+  # Specify the two parameters to the Beta distribution, and the moves on these parameters.
+  beta_cats_rates ~ dnLognormal( 0.0, sd=2*0.587405 )
+  moves.append( mvScale(beta_cats_rates, lambda=1, weight=1 ) )
+  
+  # Create the Beta distribution, according to the two parameters and the number of categories.
+  cats_r12 := fnDiscretizeBeta(beta_cats_rates, beta_cats_rates, n_cats_rates)
+  
+  # Create the binary Q matrices:
+  for( i in 1:cats_r12.size() )
+  {
+    Q[i] := fnFreeK(transition_rates = [ [0,                1], 
+                                         [abs(cats_r12[i]), 0] ], 
+                    rescaled=false, matrixExponentialMethod="eigen")
+  }
+  
+  # Tell the model what the probability of a character going into any particular category. This prior says that a character is equally likely to be put into any category.
+  Q_probs <- simplex( rep(1, n_cats_rates) )
+  
+  # Set up Gamma-distributed rate variation
+  alpha_site_rates ~ dnUniform( 0.0, 1E6 )
+  site_rates := fnDiscretizeGamma( alpha_site_rates, alpha_site_rates, n_cats_rates )
+  
+  # Moves on the parameters to the Gamma distribution.
+  moves.append( mvScale(alpha_site_rates, lambda=1, weight=1) )
+}
+
+
+#######################
+# Root frequencies
+#######################
+
+if( root_freq_model == "1" ) {
+  # The TU original:
+  root_freq <- simplex(1,1)
+}
+
+if( root_freq_model == "DP" ) {
+  # The root state frequencies are not drawn from the stationary distribution, but from a Dirichlet prior distribution:
+  # (adapted from https://revbayes.github.io/tutorials/morph/morph_more.html ):
+  rf_prior <- [1,1]
+  root_freq ~ dnDirichlet( rf_prior )
+  moves.append( mvBetaSimplex( root_freq, weight=1 ) )
+  moves.append( mvDirichletSimplex( root_freq, weight=1 ) )
+}
+
+
+
+#######################
+# The full model and data
+#######################
+
+if( site_rates_model == "MM" ) {
+  phyMorpho ~ dnPhyloCTMC( tree=psi, 
+                           Q=Q, 
+                           siteMatrices=Q_probs,
+                           siteRates=site_rates, 
+                           branchRates=branch_rates,
+                           type="Standard", 
+                           rootFrequencies=root_freq )
+} else {
+  phyMorpho ~ dnPhyloCTMC( tree=psi, 
+                           Q=Q, 
+                           branchRates=branch_rates,
+                           type="Standard", 
+                           rootFrequencies=root_freq )
+}
+phyMorpho.clamp( data )
+mymodel = model(psi)
+
+
+
+#######################
+# Monitors
+#######################
+
+# Screen progress and ancestral states monitoring make sense only if we do the MCMC:
+if( run_mcmc ) {
+  # Print progress to screen
+  monitors.append( mnScreen(printgen=printgen_screen) )
+  
+  # Save to file:
+  monitors.append( mnModel(filename="../output/" + analysis_name + ".log", printgen=printgen_model) )
+  
+  if( run_ancstates_mon ) {
+    # The ancestral states (inspired from https://revbayes.github.io/tutorials/morph/morph_more.html ):
+    monitors.append( mnJointConditionalAncestralState(tree=psi,
+                                                      ctmc=phyMorpho,
+                                                      filename="../output/anc_states/" + analysis_name + "_anc_states.txt",
+                                                      type="Standard",
+                                                      printgen=printgen_ancstates,
+                                                      withTips=true,
+                                                      withStartStates=false) )
+  }
+}
+
+
+###############
+# Run MCMC analysis
+###############
+
+if( run_mcmc ) {
+  mymcmc = mcmc(mymodel, monitors, moves, nruns=1, moveschedule="random")
+  
+  # Pre-burnin to tune the proposals:
+  mymcmc.burnin(generations=burnin_generations, tuningInterval=burnin_tuningInterval)
+  
+  # Run the MCMC:
+  mymcmc.run(generations=mcmc_generations)
+  
+  # Check the performance of the MCMC/moves:
+  mymcmc.operatorSummary()
+}
+
+
+
+###############
+# Ancestral states
+###############
+
+if( run_ancstates_estim ) { source("./compute_ancestral_states.Rev") }
+
+
+
+###############
+# Marginal likelihood
+###############
+
+if( run_marg_likelihood ) { source("./compute_marginal_likelihood.Rev") }
+
